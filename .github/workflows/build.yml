@@ -11,7 +11,9 @@ jobs:
       image: espressif/idf:v6.0.2
     steps:
       - uses: actions/checkout@v4
-      - name: Set target
-        run: idf.py set-target esp32p4
       - name: Build
-        run: idf.py build
+        shell: bash
+        run: |
+          source "$IDF_PATH/export.sh"
+          idf.py set-target esp32p4
+          idf.py build

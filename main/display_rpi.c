@@ -371,7 +371,7 @@ esp_err_t p4d_display_init(
 
     ESP_LOGI(
         TAG,
-        "display ready: %dx%d RGB888, framebuffer=%p, 1-lane DSI @ %d Mbps",
+        "display configured (output unverified): %dx%d RGB888, framebuffer=%p, 1-lane DSI @ %d Mbps",
         P4D_LCD_H_RES,
         P4D_LCD_V_RES,
         s_framebuffer,

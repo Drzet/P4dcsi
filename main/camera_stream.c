@@ -1,15 +1,19 @@
 #include "camera_stream.h"
+#include "camera_diag.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
+#include "esp_video_ioctl.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "linux/videodev2.h"
@@ -21,17 +25,21 @@ static const char *TAG = "p4d_camera";
  * components/wt_bsp/features/csi/wt_bsp_csi.c
  *
  * Only the camera parameters differ:
- * OV9281, 640x400, RAW8, 3 MMAP buffers.
+ * OV9281, 1280x720, RAW8, 3 MMAP buffers.
  */
-#define CAMERA_WIDTH             640
-#define CAMERA_HEIGHT            400
+#define CAMERA_WIDTH             P4D_CAMERA_WIDTH
+#define CAMERA_HEIGHT            P4D_CAMERA_HEIGHT
 #define CAMERA_BUFFER_COUNT      3
 #define CAMERA_TASK_STACK_SIZE   8192
 #define CAMERA_TASK_PRIORITY     5
+#define CAMERA_LANE_BIT_RATE_HZ   800000000
 
 typedef struct {
     uint8_t *buffers[CAMERA_BUFFER_COUNT];
     size_t buffer_size;
+    uint32_t buffer_count;
+    /* The sensor driver retains this pointer after VIDIOC_S_SENSOR_FMT. */
+    esp_cam_sensor_format_t sensor_format;
     int fd;
     bool initialized;
     bool streaming;
@@ -43,6 +51,45 @@ typedef struct {
 static p4d_camera_state_t s_camera = {
     .fd = -1,
 };
+
+static esp_err_t configure_sensor(int fd)
+{
+    esp_cam_sensor_format_t *sensor = &s_camera.sensor_format;
+    if (ioctl(fd, VIDIOC_G_SENSOR_FMT, sensor) != 0) {
+        ESP_LOGE(TAG, "VIDIOC_G_SENSOR_FMT failed: %d", errno);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "sensor: %s, %lux%lu, %u fps, %u lanes, metadata=%lu bit/s",
+             sensor->name, (unsigned long)sensor->width, (unsigned long)sensor->height,
+             (unsigned)sensor->fps, (unsigned)sensor->mipi_info.lane_num,
+             (unsigned long)sensor->mipi_info.mipi_clk);
+
+    if (sensor->width != CAMERA_WIDTH || sensor->height != CAMERA_HEIGHT ||
+        sensor->format != ESP_CAM_SENSOR_PIXFORMAT_RAW8 ||
+        sensor->mipi_info.lane_num != 2 ||
+        strcmp(sensor->name, "MIPI_2lane_24Minput_RAW8_1280x720_50fps") != 0) {
+        ESP_LOGE(TAG, "expected OV9281 1280x720 RAW8 mode; regenerate sdkconfig from the updated defaults");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * esp_cam_sensor 2.0.1's OV9281 table specifies 800 Mbps, but its
+     * mipi_info contains the 400 MHz DDR clock. esp_video 2.0.1 divides this
+     * field by 1e6 directly into lane_bit_rate_mbps (no DDR multiplication).
+     * Override the metadata through the public sensor-format API; retain the
+     * original register table and ISP information. No PLL register changes.
+     */
+    sensor->mipi_info.mipi_clk = CAMERA_LANE_BIT_RATE_HZ;
+    if (ioctl(fd, VIDIOC_S_SENSOR_FMT, sensor) != 0) {
+        ESP_LOGE(TAG, "VIDIOC_S_SENSOR_FMT failed: %d", errno);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "CSI receiver lane rate: %u Mbps", CAMERA_LANE_BIT_RATE_HZ / 1000000);
+    /* The mode table ends in 0x0100=1. Stop it before STREAMON configures
+     * the receiver; esp_video starts the sensor after CSI and ISP are ready. */
+    return p4d_camera_sensor_standby(fd);
+}
 
 esp_err_t p4d_camera_init(i2c_master_bus_handle_t i2c_bus)
 {
@@ -86,6 +133,11 @@ static void camera_stream_task(void *arg)
 {
     p4d_camera_state_t *camera = (p4d_camera_state_t *)arg;
     const int fd = camera->fd;
+    uint32_t frames = 0;
+    uint32_t waits = 0;
+    int64_t last_idle_break = esp_timer_get_time();
+
+    ESP_LOGI(TAG, "waiting for first CSI frame (2 s timeout)");
 
     while (camera->streaming) {
         struct v4l2_buffer buf = {
@@ -93,8 +145,18 @@ static void camera_stream_task(void *arg)
             .memory = V4L2_MEMORY_MMAP,
         };
 
+        const int64_t wait_start = esp_timer_get_time();
         if (ioctl(fd, VIDIOC_DQBUF, &buf) == 0) {
-            if (buf.index < CAMERA_BUFFER_COUNT && camera->frame_cb != NULL) {
+            if (buf.index >= camera->buffer_count || buf.bytesused > camera->buffer_size) {
+                ESP_LOGE(TAG, "invalid capture buffer: index=%u bytes=%u",
+                         (unsigned)buf.index, (unsigned)buf.bytesused);
+                break;
+            }
+            if (frames++ == 0) {
+                ESP_LOGI(TAG, "first CSI frame: index=%u bytes=%u flags=0x%lx",
+                         (unsigned)buf.index, (unsigned)buf.bytesused, (unsigned long)buf.flags);
+            }
+            if (!(buf.flags & V4L2_BUF_FLAG_ERROR) && camera->frame_cb != NULL) {
                 camera->frame_cb(
                     camera->buffers[buf.index],
                     buf.bytesused,
@@ -107,12 +169,31 @@ static void camera_stream_task(void *arg)
                 ESP_LOGE(TAG, "VIDIOC_QBUF failed: %d", errno);
                 break;
             }
-        } else {
-            if (errno != EAGAIN) {
-                ESP_LOGE(TAG, "VIDIOC_DQBUF failed: %d", errno);
-                break;
+            /* A continuously populated capture queue need not block DQBUF.
+             * Let the idle task run periodically, after returning the buffer.
+             * taskYIELD alone would not allow a lower-priority task to run. */
+            if (esp_timer_get_time() - last_idle_break >= 100000) {
+                vTaskDelay(1);
+                last_idle_break = esp_timer_get_time();
             }
-            vTaskDelay(1);
+        } else {
+            const int saved_errno = errno;
+            /* esp_video 2.0.1 maps an empty timed-out dequeue to EPERM,
+             * not EAGAIN/ETIMEDOUT. Confirm that the timeout elapsed. */
+            if (saved_errno == ETIMEDOUT || saved_errno == EAGAIN ||
+                (saved_errno == EPERM && esp_timer_get_time() - wait_start >= 1900000)) {
+                if (waits++ % 5U == 0) {
+                    ESP_LOGW(TAG, "no completed CSI frame for 2 s (received=%lu, errno=%d); display test pattern is independent",
+                             (unsigned long)frames, saved_errno);
+                    if (waits == 1) {
+                        p4d_camera_diagnostics(fd, "first capture timeout");
+                    }
+                }
+                vTaskDelay(1);
+                continue;
+            }
+            ESP_LOGE(TAG, "VIDIOC_DQBUF failed: %d", saved_errno);
+            break;
         }
     }
 
@@ -120,6 +201,8 @@ static void camera_stream_task(void *arg)
     ioctl(fd, VIDIOC_STREAMOFF, &type);
 
     camera->streaming = false;
+    close(fd);
+    camera->fd = -1;
     camera->task = NULL;
     vTaskDelete(NULL);
 }
@@ -141,6 +224,10 @@ esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
     }
     s_camera.fd = fd;
 
+    if (configure_sensor(fd) != ESP_OK) {
+        goto err;
+    }
+
     struct v4l2_format format = {
         .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
         .fmt.pix.width = CAMERA_WIDTH,
@@ -149,7 +236,7 @@ esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
     };
 
     if (ioctl(fd, VIDIOC_S_FMT, &format) != 0) {
-        ESP_LOGE(TAG, "failed to set RAW8 640x400 format");
+        ESP_LOGE(TAG, "failed to set RAW8 1280x720 format");
         goto err;
     }
 
@@ -164,10 +251,11 @@ esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
         goto err;
     }
 
-    if (req.count > CAMERA_BUFFER_COUNT) {
-        ESP_LOGE(TAG, "driver returned too many buffers: %u", (unsigned)req.count);
+    if (req.count == 0 || req.count > CAMERA_BUFFER_COUNT) {
+        ESP_LOGE(TAG, "invalid buffer count: %u", (unsigned)req.count);
         goto err;
     }
+    s_camera.buffer_count = req.count;
 
     for (uint32_t i = 0; i < req.count; ++i) {
         struct v4l2_buffer buf = {
@@ -195,11 +283,21 @@ esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
         }
 
         s_camera.buffer_size = buf.length;
+        if (buf.length < (size_t)CAMERA_WIDTH * CAMERA_HEIGHT) {
+            ESP_LOGE(TAG, "capture buffer too small: %u", (unsigned)buf.length);
+            goto err;
+        }
 
         if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
             ESP_LOGE(TAG, "failed to queue buffer %u", (unsigned)i);
             goto err;
         }
+    }
+
+    struct timeval timeout = {.tv_sec = 2, .tv_usec = 0};
+    if (ioctl(fd, VIDIOC_S_DQBUF_TIMEOUT, &timeout) != 0) {
+        ESP_LOGE(TAG, "failed to set capture timeout: %d", errno);
+        goto err;
     }
 
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -227,7 +325,7 @@ esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
         goto err;
     }
 
-    ESP_LOGI(TAG, "OV9281 capture started: 640x400 RAW8");
+    ESP_LOGI(TAG, "OV9281 stream requested: 1280x720 RAW8; waiting for actual frames");
     return ESP_OK;
 
 err:

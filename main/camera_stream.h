@@ -18,12 +18,12 @@ typedef void (*p4d_camera_frame_cb_t)(
     void *user_ctx);
 
 /**
- * Initialize OV9281 through esp_video using the caller's shared I2C bus.
- * On WT9932P4-TINY GPIO0 enables the camera power/reset rail.
+ * Initialize the WT9932P4-TINY MIPI-CSI path through esp_video using the
+ * caller's shared I2C bus. The board exposes no camera reset or PWDN GPIO.
  */
 esp_err_t p4d_camera_init(i2c_master_bus_handle_t i2c_bus);
 
-/** Start the MIPI-CSI capture task. */
+/** Start OV9281 640x400 RAW8 capture using the Wireless-Tag BSP CSI flow. */
 esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx);
 
 #ifdef __cplusplus

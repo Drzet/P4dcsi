@@ -1,13 +1,12 @@
 #include "camera_stream.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include "driver/gpio.h"
-#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
@@ -17,44 +16,33 @@
 
 static const char *TAG = "p4d_camera";
 
-#define CAMERA_POWER_GPIO      GPIO_NUM_0
-#define CAMERA_BUFFER_COUNT    3
-#define CAMERA_TASK_STACK      (16 * 1024)
-#define CAMERA_TASK_PRIORITY   8
-#define CAMERA_TASK_CORE       0
-
-#define CAMERA_WIDTH           640
-#define CAMERA_HEIGHT          400
+/*
+ * CSI flow follows Wireless-Tag's WT9932P4-TINY BSP implementation:
+ * components/wt_bsp/features/csi/wt_bsp_csi.c
+ *
+ * Only the camera parameters differ:
+ * OV9281, 640x400, RAW8, 3 MMAP buffers.
+ */
+#define CAMERA_WIDTH             640
+#define CAMERA_HEIGHT            400
+#define CAMERA_BUFFER_COUNT      3
+#define CAMERA_TASK_STACK_SIZE   8192
+#define CAMERA_TASK_PRIORITY     5
 
 typedef struct {
-    uint8_t *ptr;
-    size_t len;
-} camera_buffer_t;
+    uint8_t *buffers[CAMERA_BUFFER_COUNT];
+    size_t buffer_size;
+    int fd;
+    bool initialized;
+    bool streaming;
+    TaskHandle_t task;
+    p4d_camera_frame_cb_t frame_cb;
+    void *user_ctx;
+} p4d_camera_state_t;
 
-static int s_fd = -1;
-static camera_buffer_t s_buffers[CAMERA_BUFFER_COUNT];
-static uint32_t s_buffer_count;
-static uint32_t s_width;
-static uint32_t s_height;
-static p4d_camera_frame_cb_t s_frame_cb;
-static void *s_frame_ctx;
-static TaskHandle_t s_task;
-
-static esp_err_t camera_power_enable(void)
-{
-    const gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << CAMERA_POWER_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-
-    ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "configure camera power GPIO");
-    ESP_RETURN_ON_ERROR(gpio_set_level(CAMERA_POWER_GPIO, 1), TAG, "enable camera power");
-    vTaskDelay(pdMS_TO_TICKS(100));
-    return ESP_OK;
-}
+static p4d_camera_state_t s_camera = {
+    .fd = -1,
+};
 
 esp_err_t p4d_camera_init(i2c_master_bus_handle_t i2c_bus)
 {
@@ -62,77 +50,108 @@ esp_err_t p4d_camera_init(i2c_master_bus_handle_t i2c_bus)
         return ESP_ERR_INVALID_ARG;
     }
 
-    ESP_RETURN_ON_ERROR(camera_power_enable(), TAG, "camera power");
+    memset(&s_camera, 0, sizeof(s_camera));
+    s_camera.fd = -1;
 
-    const esp_video_init_csi_config_t csi_cfg = {
-        .sccb_config = {
-            .init_sccb = false,
-            .i2c_handle = i2c_bus,
-            .freq = 400000,
-        },
-        .reset_pin = -1,
-        .pwdn_pin = -1,
+    esp_video_init_csi_config_t csi_config = {0};
+    csi_config.sccb_config.init_sccb = false;
+    csi_config.sccb_config.i2c_handle = i2c_bus;
+    csi_config.sccb_config.freq = 400000;
+    csi_config.reset_pin = -1;
+    csi_config.pwdn_pin = -1;
+
+    esp_video_init_csi_config_t csi_config_arr[] = { csi_config };
+
+    esp_video_init_config_t video_config = {
+        .csi = csi_config_arr,
     };
 
-    const esp_video_init_config_t video_cfg = {
-        .csi = &csi_cfg,
-    };
+    /* Same startup delays used by the WT9932P4-TINY BSP CSI implementation. */
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    ESP_RETURN_ON_ERROR(esp_video_init(&video_cfg), TAG, "esp_video_init");
+    esp_err_t ret = esp_video_init(&video_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_video_init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
-    ESP_LOGI(TAG, "esp_video initialized; expecting OV9281 on MIPI CSI");
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    s_camera.initialized = true;
+    ESP_LOGI(TAG, "CSI initialized successfully");
     return ESP_OK;
 }
 
-static esp_err_t camera_open_and_map(void)
+static void camera_stream_task(void *arg)
 {
-    s_fd = open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDONLY);
-    if (s_fd < 0) {
-        ESP_LOGE(TAG, "open %s failed", ESP_VIDEO_MIPI_CSI_DEVICE_NAME);
-        return ESP_FAIL;
+    p4d_camera_state_t *camera = (p4d_camera_state_t *)arg;
+    const int fd = camera->fd;
+
+    while (camera->streaming) {
+        struct v4l2_buffer buf = {
+            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory = V4L2_MEMORY_MMAP,
+        };
+
+        if (ioctl(fd, VIDIOC_DQBUF, &buf) == 0) {
+            if (buf.index < CAMERA_BUFFER_COUNT && camera->frame_cb != NULL) {
+                camera->frame_cb(
+                    camera->buffers[buf.index],
+                    buf.bytesused,
+                    CAMERA_WIDTH,
+                    CAMERA_HEIGHT,
+                    camera->user_ctx);
+            }
+
+            if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
+                ESP_LOGE(TAG, "VIDIOC_QBUF failed: %d", errno);
+                break;
+            }
+        } else {
+            if (errno != EAGAIN) {
+                ESP_LOGE(TAG, "VIDIOC_DQBUF failed: %d", errno);
+                break;
+            }
+            vTaskDelay(1);
+        }
     }
 
-    struct v4l2_capability cap = {0};
-    if (ioctl(s_fd, VIDIOC_QUERYCAP, &cap) != 0) {
-        ESP_LOGE(TAG, "VIDIOC_QUERYCAP failed");
-        return ESP_FAIL;
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ioctl(fd, VIDIOC_STREAMOFF, &type);
+
+    camera->streaming = false;
+    camera->task = NULL;
+    vTaskDelete(NULL);
+}
+
+esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
+{
+    if (!s_camera.initialized || cb == NULL) {
+        return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "driver=%s card=%s bus=%s", cap.driver, cap.card, cap.bus_info);
+    if (s_camera.streaming) {
+        return ESP_OK;
+    }
 
-    struct v4l2_format fmt = {
+    const int fd = open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDONLY);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "failed to open %s", ESP_VIDEO_MIPI_CSI_DEVICE_NAME);
+        return ESP_FAIL;
+    }
+    s_camera.fd = fd;
+
+    struct v4l2_format format = {
         .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-        .fmt.pix = {
-            .width = CAMERA_WIDTH,
-            .height = CAMERA_HEIGHT,
-            .pixelformat = V4L2_PIX_FMT_SBGGR8,
-        },
+        .fmt.pix.width = CAMERA_WIDTH,
+        .fmt.pix.height = CAMERA_HEIGHT,
+        .fmt.pix.pixelformat = V4L2_PIX_FMT_SBGGR8,
     };
 
-    if (ioctl(s_fd, VIDIOC_S_FMT, &fmt) != 0) {
-        ESP_LOGE(TAG, "VIDIOC_S_FMT RAW8 640x400 failed");
-        return ESP_FAIL;
+    if (ioctl(fd, VIDIOC_S_FMT, &format) != 0) {
+        ESP_LOGE(TAG, "failed to set RAW8 640x400 format");
+        goto err;
     }
-
-    memset(&fmt, 0, sizeof(fmt));
-    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (ioctl(s_fd, VIDIOC_G_FMT, &fmt) != 0) {
-        ESP_LOGE(TAG, "VIDIOC_G_FMT failed");
-        return ESP_FAIL;
-    }
-
-    s_width = fmt.fmt.pix.width;
-    s_height = fmt.fmt.pix.height;
-
-    ESP_LOGI(
-        TAG,
-        "capture format %ux%u fourcc=%c%c%c%c",
-        (unsigned)s_width,
-        (unsigned)s_height,
-        (char)(fmt.fmt.pix.pixelformat & 0xff),
-        (char)((fmt.fmt.pix.pixelformat >> 8) & 0xff),
-        (char)((fmt.fmt.pix.pixelformat >> 16) & 0xff),
-        (char)((fmt.fmt.pix.pixelformat >> 24) & 0xff));
 
     struct v4l2_requestbuffers req = {
         .count = CAMERA_BUFFER_COUNT,
@@ -140,122 +159,79 @@ static esp_err_t camera_open_and_map(void)
         .memory = V4L2_MEMORY_MMAP,
     };
 
-    if (ioctl(s_fd, VIDIOC_REQBUFS, &req) != 0 || req.count < 2) {
-        ESP_LOGE(TAG, "VIDIOC_REQBUFS failed/count=%u", (unsigned)req.count);
-        return ESP_FAIL;
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) != 0) {
+        ESP_LOGE(TAG, "failed to request buffers");
+        goto err;
     }
 
-    s_buffer_count = req.count;
-    if (s_buffer_count > CAMERA_BUFFER_COUNT) {
-        s_buffer_count = CAMERA_BUFFER_COUNT;
+    if (req.count > CAMERA_BUFFER_COUNT) {
+        ESP_LOGE(TAG, "driver returned too many buffers: %u", (unsigned)req.count);
+        goto err;
     }
 
-    for (uint32_t i = 0; i < s_buffer_count; ++i) {
+    for (uint32_t i = 0; i < req.count; ++i) {
         struct v4l2_buffer buf = {
             .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
             .memory = V4L2_MEMORY_MMAP,
             .index = i,
         };
 
-        if (ioctl(s_fd, VIDIOC_QUERYBUF, &buf) != 0) {
-            ESP_LOGE(TAG, "VIDIOC_QUERYBUF %u failed", (unsigned)i);
-            return ESP_FAIL;
+        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "failed to query buffer %u", (unsigned)i);
+            goto err;
         }
 
-        void *mapped = mmap(
+        s_camera.buffers[i] = mmap(
             NULL,
             buf.length,
             PROT_READ | PROT_WRITE,
             MAP_SHARED,
-            s_fd,
+            fd,
             buf.m.offset);
 
-        if (mapped == MAP_FAILED) {
-            ESP_LOGE(TAG, "mmap buffer %u failed", (unsigned)i);
-            return ESP_FAIL;
+        if (s_camera.buffers[i] == MAP_FAILED) {
+            ESP_LOGE(TAG, "failed to mmap buffer %u", (unsigned)i);
+            goto err;
         }
 
-        s_buffers[i].ptr = (uint8_t *)mapped;
-        s_buffers[i].len = buf.length;
+        s_camera.buffer_size = buf.length;
 
-        if (ioctl(s_fd, VIDIOC_QBUF, &buf) != 0) {
-            ESP_LOGE(TAG, "VIDIOC_QBUF %u failed", (unsigned)i);
-            return ESP_FAIL;
+        if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "failed to queue buffer %u", (unsigned)i);
+            goto err;
         }
     }
 
-    return ESP_OK;
-}
-
-static void camera_task(void *arg)
-{
-    (void)arg;
-
-    while (true) {
-        struct v4l2_buffer buf = {
-            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-            .memory = V4L2_MEMORY_MMAP,
-        };
-
-        if (ioctl(s_fd, VIDIOC_DQBUF, &buf) != 0) {
-            ESP_LOGE(TAG, "VIDIOC_DQBUF failed");
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        if (buf.index < s_buffer_count && s_frame_cb != NULL) {
-            size_t len = buf.bytesused ? buf.bytesused : s_buffers[buf.index].len;
-            s_frame_cb(
-                s_buffers[buf.index].ptr,
-                len,
-                s_width,
-                s_height,
-                s_frame_ctx);
-        }
-
-        if (ioctl(s_fd, VIDIOC_QBUF, &buf) != 0) {
-            ESP_LOGE(TAG, "VIDIOC_QBUF failed");
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-}
-
-esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
-{
-    if (cb == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (s_task != NULL) {
-        return ESP_ERR_INVALID_STATE;
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) != 0) {
+        ESP_LOGE(TAG, "failed to start stream");
+        goto err;
     }
 
-    ESP_RETURN_ON_ERROR(camera_open_and_map(), TAG, "open/map camera");
+    s_camera.frame_cb = cb;
+    s_camera.user_ctx = user_ctx;
+    s_camera.streaming = true;
 
-    s_frame_cb = cb;
-    s_frame_ctx = user_ctx;
-
-    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (ioctl(s_fd, VIDIOC_STREAMON, &type) != 0) {
-        ESP_LOGE(TAG, "VIDIOC_STREAMON failed");
-        return ESP_FAIL;
-    }
-
-    BaseType_t ok = xTaskCreatePinnedToCore(
-        camera_task,
-        "ov9281_capture",
-        CAMERA_TASK_STACK,
-        NULL,
+    BaseType_t res = xTaskCreate(
+        camera_stream_task,
+        "csi_stream",
+        CAMERA_TASK_STACK_SIZE,
+        &s_camera,
         CAMERA_TASK_PRIORITY,
-        &s_task,
-        CAMERA_TASK_CORE);
+        &s_camera.task);
 
-    if (ok != pdPASS) {
-        ESP_LOGE(TAG, "failed to create capture task");
-        ioctl(s_fd, VIDIOC_STREAMOFF, &type);
-        s_task = NULL;
-        return ESP_ERR_NO_MEM;
+    if (res != pdPASS) {
+        ESP_LOGE(TAG, "failed to create stream task");
+        s_camera.streaming = false;
+        ioctl(fd, VIDIOC_STREAMOFF, &type);
+        goto err;
     }
 
-    ESP_LOGI(TAG, "OV9281 capture started");
+    ESP_LOGI(TAG, "OV9281 capture started: 640x400 RAW8");
     return ESP_OK;
+
+err:
+    close(fd);
+    s_camera.fd = -1;
+    return ESP_FAIL;
 }

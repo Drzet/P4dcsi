@@ -9,7 +9,6 @@ idf_component_register(
         esp_mm
         esp_hw_support
         esp_driver_i2c
-        esp_driver_gpio
         esp_hal_lcd
         espressif__esp_video
         espressif__esp_cam_sensor

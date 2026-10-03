@@ -6,7 +6,7 @@ End-to-end hardware test for:
 - **OV9281** MIPI-CSI monochrome camera
 - **iPistBit 4.3" 800x480** Raspberry-Pi-style MIPI-DSI display
 
-The firmware uses the WT9932P4-TINY shared I2C wiring on GPIO7/8. GPIO0 is driven high to enable the camera rail.
+The firmware uses the WT9932P4-TINY shared I2C wiring on GPIO7/8. The CSI side follows Wireless-Tag's WT9932P4-TINY BSP implementation; camera reset and PWDN are both unused (`-1`).
 
 ## Test path
 
@@ -30,6 +30,8 @@ ESP32-P4 MIPI DSI
         v
 Pi-style ATTINY88 (0x45) + TC358762 bridge
 ```
+
+The camera capture flow is taken from Wireless-Tag's current WT9932P4-TINY BSP `wt_bsp_csi.c`: `esp_video_init`, `VIDIOC_S_FMT`, MMAP buffers, `VIDIOC_QBUF`, `VIDIOC_STREAMON`, then `VIDIOC_DQBUF` / callback / `VIDIOC_QBUF`. Only the OV9281-specific width, height and RAW8 pixel format are substituted.
 
 The display driver is based on the working ESP32-P4 Raspberry-Pi-display implementation at
 `oguzhanbaser/esp32-p4-waveshare-5inch-dsi-lcd`. It uses one DSI data lane at 600 Mbps and the established TC358762 Generic Long Write initialization sequence.

@@ -3,11 +3,7 @@
 
 #include "driver/i2c_master.h"
 #include "esp_err.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_lvgl_port.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
 #include "camera_stream.h"
 #include "display_rpi.h"
@@ -20,13 +16,12 @@ static const char *TAG = "P4dcsi";
 
 #define CAM_W                640
 #define CAM_H                400
+#define CAM_X_OFFSET         ((P4D_LCD_H_RES - CAM_W) / 2)
+#define CAM_Y_OFFSET         ((P4D_LCD_V_RES - CAM_H) / 2)
 #define DISPLAY_EVERY_N      4
-#define CANVAS_BUF_BYTES     (CAM_W * CAM_H * sizeof(uint16_t))
 
-static lv_obj_t *s_canvas;
-static lv_obj_t *s_status;
-static uint16_t *s_canvas_buf[2];
-static int s_front_buf;
+static uint8_t *s_display_fb;
+static size_t s_display_fb_size;
 static uint32_t s_capture_frames;
 static uint32_t s_display_frames;
 
@@ -60,70 +55,7 @@ static void diagnostic_i2c_probe(i2c_master_bus_handle_t bus)
     probe_addr(bus, 0x45, "panel MCU");
     probe_addr(bus, 0x38, "touch");
     probe_addr(bus, 0x60, "OV9281 SID-low");
-    probe_addr(bus, 0x30, "alt camera addr");
-}
-
-static void ui_set_status(const char *text)
-{
-    if (s_status == NULL) {
-        return;
-    }
-
-    if (lvgl_port_lock(1000)) {
-        lv_label_set_text(s_status, text);
-        lvgl_port_unlock();
-    }
-}
-
-static esp_err_t ui_init(lv_display_t *disp)
-{
-    s_canvas_buf[0] = heap_caps_malloc(
-        CANVAS_BUF_BYTES,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_canvas_buf[1] = heap_caps_malloc(
-        CANVAS_BUF_BYTES,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-    if (s_canvas_buf[0] == NULL || s_canvas_buf[1] == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    for (size_t i = 0; i < CAM_W * CAM_H; ++i) {
-        s_canvas_buf[0][i] = 0;
-        s_canvas_buf[1][i] = 0;
-    }
-
-    if (!lvgl_port_lock(1000)) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    lv_obj_t *screen = lv_display_get_screen_active(disp);
-    lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN);
-
-    s_canvas = lv_canvas_create(screen);
-    lv_canvas_set_buffer(
-        s_canvas,
-        s_canvas_buf[0],
-        CAM_W,
-        CAM_H,
-        LV_COLOR_FORMAT_RGB565);
-    lv_obj_center(s_canvas);
-
-    s_status = lv_label_create(screen);
-    lv_label_set_text(s_status, "P4dcsi: display ready, starting OV9281...");
-    lv_obj_set_style_text_color(s_status, lv_color_white(), LV_PART_MAIN);
-    lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 8);
-
-    lvgl_port_unlock();
-    return ESP_OK;
-}
-
-static inline uint16_t gray_to_rgb565(uint8_t gray)
-{
-    return (uint16_t)(
-        ((uint16_t)(gray >> 3) << 11) |
-        ((uint16_t)(gray >> 2) << 5) |
-        (uint16_t)(gray >> 3));
+    probe_addr(bus, 0x30, "alternate camera");
 }
 
 static void camera_frame(
@@ -155,41 +87,41 @@ static void camera_frame(
         return;
     }
 
-    const int back = 1 - s_front_buf;
-    uint16_t *dst = s_canvas_buf[back];
+    for (uint32_t y = 0; y < CAM_H; ++y) {
+        const uint8_t *src = data + (size_t)y * CAM_W;
+        uint8_t *dst = s_display_fb +
+            (((size_t)(y + CAM_Y_OFFSET) * P4D_LCD_H_RES + CAM_X_OFFSET) *
+             P4D_LCD_BYTES_PER_PIXEL);
 
-    for (size_t i = 0; i < (size_t)(CAM_W * CAM_H); ++i) {
-        dst[i] = gray_to_rgb565(data[i]);
+        for (uint32_t x = 0; x < CAM_W; ++x) {
+            const uint8_t gray = src[x];
+            dst[0] = gray;
+            dst[1] = gray;
+            dst[2] = gray;
+            dst += P4D_LCD_BYTES_PER_PIXEL;
+        }
     }
 
-    if (lvgl_port_lock(1000)) {
-        lv_canvas_set_buffer(
-            s_canvas,
-            dst,
-            CAM_W,
-            CAM_H,
-            LV_COLOR_FORMAT_RGB565);
-        lv_obj_invalidate(s_canvas);
+    if (p4d_display_sync() != ESP_OK) {
+        ESP_LOGE(TAG, "display cache sync failed");
+        return;
+    }
 
-        ++s_display_frames;
-        if ((s_display_frames % 25) == 0) {
-            lv_label_set_text_fmt(
-                s_status,
-                "OV9281 live  %ux%u  capture=%lu  display=%lu",
-                (unsigned)width,
-                (unsigned)height,
-                (unsigned long)s_capture_frames,
-                (unsigned long)s_display_frames);
-        }
-
-        s_front_buf = back;
-        lvgl_port_unlock();
+    ++s_display_frames;
+    if ((s_display_frames % 25) == 0) {
+        ESP_LOGI(
+            TAG,
+            "live: capture=%lu display=%lu, %ux%u RAW8 -> centered 800x480 RGB888",
+            (unsigned long)s_capture_frames,
+            (unsigned long)s_display_frames,
+            (unsigned)width,
+            (unsigned)height);
     }
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "WT9932P4-TINY + OV9281 + 800x480 Pi-style DSI test");
+    ESP_LOGI(TAG, "WT9932P4-TINY + OV9281 + iPistBit 800x480 DSI test");
 
     i2c_master_bus_handle_t i2c_bus = NULL;
     esp_err_t err = shared_i2c_init(&i2c_bus);
@@ -198,23 +130,18 @@ void app_main(void)
         return;
     }
 
-    lv_display_t *disp = NULL;
-    err = p4d_display_init(i2c_bus, &disp);
+    err = p4d_display_init(i2c_bus, &s_display_fb, &s_display_fb_size);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "display init failed: %s", esp_err_to_name(err));
+        diagnostic_i2c_probe(i2c_bus);
         return;
     }
 
-    err = ui_init(disp);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "UI init failed: %s", esp_err_to_name(err));
-        return;
-    }
+    ESP_LOGI(TAG, "display framebuffer size=%u", (unsigned)s_display_fb_size);
 
     err = p4d_camera_init(i2c_bus);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "camera init failed: %s", esp_err_to_name(err));
-        ui_set_status("OV9281 init FAILED - see serial log");
         diagnostic_i2c_probe(i2c_bus);
         return;
     }
@@ -224,10 +151,8 @@ void app_main(void)
     err = p4d_camera_start(camera_frame, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "camera stream start failed: %s", esp_err_to_name(err));
-        ui_set_status("OV9281 stream FAILED - see serial log");
         return;
     }
 
-    ui_set_status("OV9281 stream started - waiting for frames");
     ESP_LOGI(TAG, "end-to-end test running");
 }

@@ -10,16 +10,17 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_cache.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_ldo_regulator.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
-#include "esp_lvgl_port.h"
 
 #include "hal/mipi_dsi_hal.h"
 #include "hal/mipi_dsi_host_ll.h"
@@ -29,15 +30,9 @@
 
 static const char *TAG = "p4d_display";
 
-/* WT9932P4-TINY MIPI PHY supply. */
 #define P4D_DSI_PHY_LDO_CHAN  3
 #define P4D_DSI_PHY_LDO_MV    2500
 
-/*
- * TC358762 is operated as one DSI data lane. These timings are the
- * ESP32-P4 values already demonstrated with the RPi 7" V1 / compatible
- * 800x480 bridge electronics.
- */
 #define P4D_DSI_LANE_NUM      1
 #define P4D_DSI_LANE_MBPS     600
 #define P4D_DPI_CLK_MHZ       25.98
@@ -49,7 +44,6 @@ static const char *TAG = "p4d_display";
 #define P4D_MODE_VSW          20
 #define P4D_MODE_VBP          4
 
-/* ATTINY88 panel-control MCU. */
 #define ATTINY_ADDR            0x45
 #define ATTINY_SCL_HZ          100000
 #define ATTINY_SCL_WAIT_US     50000
@@ -69,11 +63,9 @@ static const char *TAG = "p4d_display";
 #define PA_LCD_LR              BIT(2)
 #define PB_LCD_MAIN            BIT(7)
 #define PC_LED_EN              BIT(0)
-#define PC_RST_TP_N            BIT(1)
 #define PC_RST_LCD_N           BIT(2)
 #define PC_RST_BRIDGE_N        BIT(3)
 
-/* TC358762 registers. */
 #define TC_PPI_STARTPPI          0x0104
 #define TC_PPI_LPTXTIMECNT       0x0114
 #define TC_PPI_D0S_ATMR          0x0144
@@ -90,8 +82,6 @@ static const char *TAG = "p4d_display";
 #define TC_SPICMR                0x0450
 #define TC_SYSCTRL               0x0464
 
-#define P4D_LVGL_BUF_PX          (P4D_LCD_H_RES * 32)
-
 /*
  * esp_lcd_dsi_bus_t is opaque. The working reference driver accesses its HAL
  * context to emit Generic Long Write packets required by TC358762. These are
@@ -107,6 +97,8 @@ static i2c_master_dev_handle_t s_attiny;
 static esp_ldo_channel_handle_t s_phy_ldo;
 static esp_lcd_dsi_bus_handle_t s_dsi_bus;
 static esp_lcd_panel_handle_t s_panel;
+static uint8_t *s_framebuffer;
+static size_t s_framebuffer_size;
 static bool s_panel_powered;
 
 static esp_err_t attiny_write(uint8_t reg, uint8_t val)
@@ -162,7 +154,6 @@ static esp_err_t panel_power_on(void)
 
 static esp_err_t bridge_release_reset(void)
 {
-    /* Keep touch held in reset; only LCD + bridge are required for this test. */
     ESP_RETURN_ON_ERROR(
         attiny_write(REG_PORTC, PC_LED_EN | PC_RST_LCD_N | PC_RST_BRIDGE_N),
         TAG, "release bridge reset");
@@ -203,7 +194,7 @@ static void tc358762_reg_write(uint16_t reg, uint32_t val)
 
 static void tc358762_bridge_init(void)
 {
-    tc358762_reg_write(TC_DSI_LANEENABLE, BIT(0) | BIT(1)); /* clock + D0 */
+    tc358762_reg_write(TC_DSI_LANEENABLE, BIT(0) | BIT(1));
     tc358762_reg_write(TC_PPI_D0S_CLRSIPOCOUNT, 0x05);
     tc358762_reg_write(TC_PPI_D1S_CLRSIPOCOUNT, 0x05);
     tc358762_reg_write(TC_PPI_D0S_ATMR, 0x00);
@@ -211,7 +202,7 @@ static void tc358762_bridge_init(void)
     tc358762_reg_write(TC_PPI_LPTXTIMECNT, 0x03);
 
     tc358762_reg_write(TC_SPICMR, 0x00);
-    tc358762_reg_write(TC_LCDCTRL, 0x00100150); /* VTGEN + RGB888 */
+    tc358762_reg_write(TC_LCDCTRL, 0x00100150);
     tc358762_reg_write(TC_SYSCTRL, 0x040f);
 
     tc358762_reg_write(TC_LCD_HS_HBP, (P4D_MODE_HBP << 16) | P4D_MODE_HSW);
@@ -223,6 +214,18 @@ static void tc358762_bridge_init(void)
     tc358762_reg_write(TC_PPI_STARTPPI, 0x01);
     tc358762_reg_write(TC_DSI_STARTDSI, 0x01);
     vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+esp_err_t p4d_display_sync(void)
+{
+    if (s_framebuffer == NULL || s_framebuffer_size == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return esp_cache_msync(
+        s_framebuffer,
+        s_framebuffer_size,
+        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 }
 
 esp_err_t p4d_display_brightness_set(int brightness)
@@ -240,10 +243,14 @@ esp_err_t p4d_display_brightness_set(int brightness)
     return attiny_write(REG_PWM, (uint8_t)brightness);
 }
 
-esp_err_t p4d_display_init(i2c_master_bus_handle_t i2c_bus, lv_display_t **ret_disp)
+esp_err_t p4d_display_init(
+    i2c_master_bus_handle_t i2c_bus,
+    uint8_t **ret_framebuffer,
+    size_t *ret_framebuffer_size)
 {
     ESP_RETURN_ON_FALSE(i2c_bus != NULL, ESP_ERR_INVALID_ARG, TAG, "I2C bus is NULL");
-    ESP_RETURN_ON_FALSE(ret_disp != NULL, ESP_ERR_INVALID_ARG, TAG, "ret_disp is NULL");
+    ESP_RETURN_ON_FALSE(ret_framebuffer != NULL, ESP_ERR_INVALID_ARG, TAG, "framebuffer pointer is NULL");
+    ESP_RETURN_ON_FALSE(ret_framebuffer_size != NULL, ESP_ERR_INVALID_ARG, TAG, "framebuffer size pointer is NULL");
 
     s_i2c_bus = i2c_bus;
 
@@ -294,10 +301,6 @@ esp_err_t p4d_display_init(i2c_master_bus_handle_t i2c_bus, lv_display_t **ret_d
         TAG,
         "create DSI bus");
 
-    /*
-     * Create/delete a DBI IO once so the low-power command path is configured.
-     * TC358762 itself is then programmed with Generic Long Writes via the HAL.
-     */
     esp_lcd_panel_io_handle_t dbi_io = NULL;
     const esp_lcd_dbi_io_config_t dbi_cfg = {
         .virtual_channel = 0,
@@ -342,6 +345,17 @@ esp_err_t p4d_display_init(i2c_master_bus_handle_t i2c_bus, lv_display_t **ret_d
 
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "init DPI panel");
 
+    void *framebuffer = NULL;
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_dpi_panel_get_frame_buffer(s_panel, 1, &framebuffer),
+        TAG,
+        "get DPI framebuffer");
+
+    s_framebuffer = (uint8_t *)framebuffer;
+    s_framebuffer_size = P4D_LCD_FB_SIZE;
+    memset(s_framebuffer, 0, s_framebuffer_size);
+    ESP_RETURN_ON_ERROR(p4d_display_sync(), TAG, "clear framebuffer");
+
     mipi_dsi_host_ll_set_clock_lane_state(
         priv->hal.host,
         MIPI_DSI_LL_CLOCK_LANE_STATE_HS);
@@ -352,46 +366,15 @@ esp_err_t p4d_display_init(i2c_master_bus_handle_t i2c_bus, lv_display_t **ret_d
 
     ESP_RETURN_ON_ERROR(p4d_display_brightness_set(255), TAG, "set backlight");
 
-    lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
-    lvgl_cfg.task_stack = 12288;
-    ESP_RETURN_ON_ERROR(lvgl_port_init(&lvgl_cfg), TAG, "init LVGL port");
-
-    const lvgl_port_display_cfg_t display_cfg = {
-        .io_handle = NULL,
-        .panel_handle = s_panel,
-        .control_handle = NULL,
-        .buffer_size = P4D_LVGL_BUF_PX,
-        .double_buffer = false,
-        .hres = P4D_LCD_H_RES,
-        .vres = P4D_LCD_V_RES,
-        .monochrome = false,
-        .rotation = {
-            .swap_xy = false,
-            .mirror_x = false,
-            .mirror_y = false,
-        },
-        .color_format = LV_COLOR_FORMAT_RGB888,
-        .flags = {
-            .buff_dma = false,
-            .buff_spiram = true,
-            .swap_bytes = false,
-            .sw_rotate = false,
-        },
-    };
-    const lvgl_port_display_dsi_cfg_t dsi_display_cfg = {
-        .flags.avoid_tearing = false,
-    };
-
-    lv_display_t *disp = lvgl_port_add_disp_dsi(&display_cfg, &dsi_display_cfg);
-    ESP_RETURN_ON_FALSE(disp != NULL, ESP_FAIL, TAG, "add DSI display to LVGL");
-
-    *ret_disp = disp;
+    *ret_framebuffer = s_framebuffer;
+    *ret_framebuffer_size = s_framebuffer_size;
 
     ESP_LOGI(
         TAG,
-        "display ready: %dx%d, 1-lane DSI @ %d Mbps",
+        "display ready: %dx%d RGB888, framebuffer=%p, 1-lane DSI @ %d Mbps",
         P4D_LCD_H_RES,
         P4D_LCD_V_RES,
+        s_framebuffer,
         P4D_DSI_LANE_MBPS);
 
     return ESP_OK;

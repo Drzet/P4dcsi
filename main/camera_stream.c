@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "driver/gpio.h"
+#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"

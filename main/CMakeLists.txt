@@ -6,12 +6,14 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES
         esp_lcd
+        esp_mm
         esp_hw_support
         esp_driver_i2c
         esp_driver_gpio
         esp_hal_lcd
-        espressif__esp_lvgl_port
         espressif__esp_video
         espressif__esp_cam_sensor
-        lvgl__lvgl
 )
+
+# esp_cam_sensor 2.0.1 uses link-time sensor registration.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-u ov9281_detect")

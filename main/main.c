@@ -14,11 +14,14 @@ static const char *TAG = "P4dcsi";
 #define BOARD_I2C_SDA        7
 #define BOARD_I2C_SCL        8
 
-#define CAM_W                640
-#define CAM_H                400
-#define CAM_X_OFFSET         ((P4D_LCD_H_RES - CAM_W) / 2)
-#define CAM_Y_OFFSET         ((P4D_LCD_V_RES - CAM_H) / 2)
-#define DISPLAY_EVERY_N      4
+#define CAM_W                1280
+#define CAM_H                720
+
+/* 1280x720 -> 800x450 exactly preserves 16:9. */
+#define PREVIEW_W            800
+#define PREVIEW_H            450
+#define PREVIEW_X_OFFSET     0
+#define PREVIEW_Y_OFFSET     ((P4D_LCD_V_RES - PREVIEW_H) / 2)
 
 static uint8_t *s_display_fb;
 static size_t s_display_fb_size;
@@ -69,10 +72,6 @@ static void camera_frame(
 
     ++s_capture_frames;
 
-    if ((s_capture_frames % DISPLAY_EVERY_N) != 0) {
-        return;
-    }
-
     if (width != CAM_W || height != CAM_H || len < (size_t)(CAM_W * CAM_H)) {
         static bool warned = false;
         if (!warned) {
@@ -87,14 +86,22 @@ static void camera_frame(
         return;
     }
 
-    for (uint32_t y = 0; y < CAM_H; ++y) {
-        const uint8_t *src = data + (size_t)y * CAM_W;
+    /*
+     * 1280->800 and 720->450 are both exactly 5/8.
+     * Use nearest-neighbour sampling for the bring-up firmware.
+     * There is deliberately no frame limiter: every captured frame updates
+     * the framebuffer; the DSI engine displays whichever image is current.
+     */
+    for (uint32_t y = 0; y < PREVIEW_H; ++y) {
+        const uint32_t src_y = (y * 8U) / 5U;
+        const uint8_t *src = data + (size_t)src_y * CAM_W;
         uint8_t *dst = s_display_fb +
-            (((size_t)(y + CAM_Y_OFFSET) * P4D_LCD_H_RES + CAM_X_OFFSET) *
+            (((size_t)(y + PREVIEW_Y_OFFSET) * P4D_LCD_H_RES + PREVIEW_X_OFFSET) *
              P4D_LCD_BYTES_PER_PIXEL);
 
-        for (uint32_t x = 0; x < CAM_W; ++x) {
-            const uint8_t gray = src[x];
+        for (uint32_t x = 0; x < PREVIEW_W; ++x) {
+            const uint32_t src_x = (x * 8U) / 5U;
+            const uint8_t gray = src[src_x];
             dst[0] = gray;
             dst[1] = gray;
             dst[2] = gray;
@@ -108,14 +115,12 @@ static void camera_frame(
     }
 
     ++s_display_frames;
-    if ((s_display_frames % 25) == 0) {
+    if ((s_display_frames % 50U) == 0) {
         ESP_LOGI(
             TAG,
-            "live: capture=%lu display=%lu, %ux%u RAW8 -> centered 800x480 RGB888",
+            "live: capture=%lu display=%lu, 1280x720 RAW8 -> 800x450 RGB888",
             (unsigned long)s_capture_frames,
-            (unsigned long)s_display_frames,
-            (unsigned)width,
-            (unsigned)height);
+            (unsigned long)s_display_frames);
     }
 }
 

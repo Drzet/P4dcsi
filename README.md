@@ -11,17 +11,19 @@ The firmware uses the WT9932P4-TINY shared I2C wiring on GPIO7/8. GPIO0 is drive
 ## Test path
 
 ```
-OV9281 640x400 RAW8 @ 100 fps
+OV9281 1280x720 RAW8 @ 50 fps
         |
         v
 ESP32-P4 MIPI CSI / esp_video
         |
         v
-display every fourth frame (~25 fps target)
+every captured frame
+nearest-neighbour 1280x720 -> 800x450
 RAW8 -> RGB888 grayscale
         |
         v
-800x480 native DPI framebuffer (640x400 image centered)
+800x480 native DPI framebuffer
+(800x450 image, 15-pixel black bars top/bottom)
         |
         v
 ESP32-P4 MIPI DSI
@@ -33,7 +35,9 @@ Pi-style ATTINY88 (0x45) + TC358762 bridge
 The display driver is based on the working ESP32-P4 Raspberry-Pi-display implementation at
 `oguzhanbaser/esp32-p4-waveshare-5inch-dsi-lcd`. It uses one DSI data lane at 600 Mbps and the established TC358762 Generic Long Write initialization sequence.
 
-The first test deliberately omits touch, LVGL, USB, recording, SD, and image processing beyond RAW8-to-grayscale conversion.
+There is no firmware frame limiter. Each OV9281 frame is converted into the display framebuffer as it arrives.
+
+The first test deliberately omits touch, LVGL, USB, recording, SD, and other image processing.
 
 ## Expected I2C diagnostics
 
@@ -48,7 +52,7 @@ If `0x45` is absent, this iPistBit revision is not exposing the expected Pi-styl
 
 ## Build
 
-CI uses ESP-IDF 6.0.2.
+The project requires ESP-IDF `>=6.0.2`. CI currently builds with ESP-IDF 6.0.2.
 
 ```sh
 idf.py set-target esp32p4

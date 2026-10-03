@@ -16,11 +16,11 @@ static const char *TAG = "P4dcsi";
 #define BOARD_I2C_SDA        7
 #define BOARD_I2C_SCL        8
 
-#define CAM_W                640
-#define CAM_H                400
+#define CAM_W                P4D_CAMERA_WIDTH
+#define CAM_H                P4D_CAMERA_HEIGHT
 
-#define PREVIEW_W            CAM_W
-#define PREVIEW_H            CAM_H
+#define PREVIEW_W            P4D_LCD_H_RES
+#define PREVIEW_H            (PREVIEW_W * CAM_H / CAM_W)
 #define PREVIEW_X_OFFSET     ((P4D_LCD_H_RES - PREVIEW_W) / 2)
 #define PREVIEW_Y_OFFSET     ((P4D_LCD_V_RES - PREVIEW_H) / 2)
 
@@ -28,6 +28,10 @@ static uint8_t *s_display_fb;
 static size_t s_display_fb_size;
 static uint32_t s_capture_frames;
 static uint32_t s_display_frames;
+static uint16_t s_preview_src_x[PREVIEW_W];
+
+_Static_assert(PREVIEW_W <= P4D_LCD_H_RES && PREVIEW_H <= P4D_LCD_V_RES,
+               "Preview must fit the framebuffer");
 
 static esp_err_t display_test_pattern(void)
 {
@@ -119,18 +123,19 @@ static void camera_frame(
     }
 
     /*
-     * Native-size 640x400 preview centred in the 800x480 framebuffer.
+     * Scale the complete 1280x720 frame to an 800x450 preview using nearest
+     * neighbour sampling, preserving aspect ratio with 15-pixel borders.
      * There is deliberately no frame limiter: every captured frame updates
      * the framebuffer; the DSI engine displays whichever image is current.
      */
     for (uint32_t y = 0; y < PREVIEW_H; ++y) {
-        const uint8_t *src = data + (size_t)y * CAM_W;
+        const uint8_t *src = data + (size_t)(y * CAM_H / PREVIEW_H) * CAM_W;
         uint8_t *dst = s_display_fb +
             (((size_t)(y + PREVIEW_Y_OFFSET) * P4D_LCD_H_RES + PREVIEW_X_OFFSET) *
              P4D_LCD_BYTES_PER_PIXEL);
 
         for (uint32_t x = 0; x < PREVIEW_W; ++x) {
-            const uint8_t gray = src[x];
+            const uint8_t gray = src[s_preview_src_x[x]];
             dst[0] = gray;
             dst[1] = gray;
             dst[2] = gray;
@@ -147,7 +152,7 @@ static void camera_frame(
     if ((s_display_frames % 50U) == 0) {
         ESP_LOGI(
             TAG,
-            "live: capture=%lu display=%lu, 640x400 RAW8 -> centred RGB888",
+            "live: capture=%lu display=%lu, 1280x720 RAW8 -> 800x450 RGB888",
             (unsigned long)s_capture_frames,
             (unsigned long)s_display_frames);
     }
@@ -155,6 +160,9 @@ static void camera_frame(
 
 void app_main(void)
 {
+    for (uint32_t x = 0; x < PREVIEW_W; ++x) {
+        s_preview_src_x[x] = x * CAM_W / PREVIEW_W;
+    }
     ESP_LOGI(TAG, "WT9932P4-TINY + OV9281 + iPistBit 800x480 DSI test");
 
     i2c_master_bus_handle_t i2c_bus = NULL;

@@ -11,18 +11,18 @@ The firmware uses the WT9932P4-TINY shared I2C wiring on GPIO7/8. The CSI side f
 ## Test path
 
 ```
-OV9281 640x400 RAW8 @ 100 fps
+OV9281 1280x720 RAW8 @ 50 fps
         |
         v
 ESP32-P4 MIPI CSI / esp_video
         |
         v
 every captured frame
-RAW8 -> RGB888 grayscale
+RAW8 -> scaled RGB888 grayscale
         |
         v
 800x480 native DPI framebuffer
-(640x400 image centred, 80 px left/right, 40 px top/bottom)
+(800x450 image centred, 15 px top/bottom)
         |
         v
 ESP32-P4 MIPI DSI
@@ -69,7 +69,7 @@ On boot:
 
 1. The CPU writes colour bars directly to the display framebuffer and holds them
    for three seconds **before any camera initialization**. They remain until a
-   camera frame overwrites the central 640x400 area. The coloured border remains
+   camera frame overwrites the central 800x450 area. The coloured border remains
    visible even if the camera image itself is black.
 2. The log prints the actual sensor mode and the corrected CSI lane rate. An
    incompatible saved `sdkconfig` is rejected instead of being silently assumed
@@ -100,6 +100,11 @@ The display driver is based on the working ESP32-P4 Raspberry-Pi-display impleme
 
 There is no firmware frame limiter. Each OV9281 frame is converted into the display framebuffer as it arrives.
 
+The current test uses the driver's 1280x720 RAW8 / 50 fps mode. Each capture buffer
+contains 921,600 bytes. Preview uses nearest-neighbour scaling to 800x450, retaining
+the whole frame and its aspect ratio; the panel cannot display all captured pixels
+at once. The standby sequencing and periodic idle-task break are retained.
+
 The first test deliberately omits touch, LVGL, USB, recording, SD, and other image processing.
 
 ## Expected I2C diagnostics
@@ -121,5 +126,14 @@ The project requires ESP-IDF `>=6.0.3`. CI builds with ESP-IDF 6.0.3.
 idf.py set-target esp32p4
 idf.py build
 ```
+
+When updating an existing 640x400 checkout, use a fresh configuration file so the
+saved low-resolution selection does not override the new defaults:
+
+```sh
+idf.py -D SDKCONFIG=sdkconfig.hd build flash monitor
+```
+
+The boot log must show `MIPI_2lane_24Minput_RAW8_1280x720_50fps`.
 
 Both CSI and DSI FFCs on this WT9932P4-TINY setup use same-side-contact ribbons.

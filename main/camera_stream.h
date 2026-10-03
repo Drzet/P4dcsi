@@ -6,6 +6,9 @@
 #include "driver/i2c_master.h"
 #include "esp_err.h"
 
+#define P4D_CAMERA_WIDTH 1280
+#define P4D_CAMERA_HEIGHT 720
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -23,7 +26,7 @@ typedef void (*p4d_camera_frame_cb_t)(
  */
 esp_err_t p4d_camera_init(i2c_master_bus_handle_t i2c_bus);
 
-/** Start OV9281 640x400 RAW8 capture using the Wireless-Tag BSP CSI flow. */
+/** Start OV9281 1280x720 RAW8 capture using the Wireless-Tag BSP CSI flow. */
 esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx);
 
 #ifdef __cplusplus

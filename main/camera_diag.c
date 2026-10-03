@@ -49,8 +49,8 @@ esp_err_t p4d_camera_sensor_standby(int fd)
         ESP_LOGE(TAG, "sensor standby failed: errno=%d", errno);
         return ESP_FAIL;
     }
-    /* Allow more than two nominal 10 ms frame periods before receiver setup. */
-    vTaskDelay(pdMS_TO_TICKS(30));
+    /* Allow more than two nominal 20 ms frame periods before receiver setup. */
+    vTaskDelay(pdMS_TO_TICKS(50));
     uint32_t mode;
     if (sensor_read(fd, 0x0100, &mode) != 0 || (mode & 1U)) {
         ESP_LOGE(TAG, "sensor did not confirm standby");

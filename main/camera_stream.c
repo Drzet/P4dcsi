@@ -25,10 +25,10 @@ static const char *TAG = "p4d_camera";
  * components/wt_bsp/features/csi/wt_bsp_csi.c
  *
  * Only the camera parameters differ:
- * OV9281, 640x400, RAW8, 3 MMAP buffers.
+ * OV9281, 1280x720, RAW8, 3 MMAP buffers.
  */
-#define CAMERA_WIDTH             640
-#define CAMERA_HEIGHT            400
+#define CAMERA_WIDTH             P4D_CAMERA_WIDTH
+#define CAMERA_HEIGHT            P4D_CAMERA_HEIGHT
 #define CAMERA_BUFFER_COUNT      3
 #define CAMERA_TASK_STACK_SIZE   8192
 #define CAMERA_TASK_PRIORITY     5
@@ -68,8 +68,8 @@ static esp_err_t configure_sensor(int fd)
     if (sensor->width != CAMERA_WIDTH || sensor->height != CAMERA_HEIGHT ||
         sensor->format != ESP_CAM_SENSOR_PIXFORMAT_RAW8 ||
         sensor->mipi_info.lane_num != 2 ||
-        strcmp(sensor->name, "MIPI_2lane_24Minput_RAW8_640x400_100fps") != 0) {
-        ESP_LOGE(TAG, "expected OV9281 640x400 RAW8 mode; check active sdkconfig, not just sdkconfig.defaults");
+        strcmp(sensor->name, "MIPI_2lane_24Minput_RAW8_1280x720_50fps") != 0) {
+        ESP_LOGE(TAG, "expected OV9281 1280x720 RAW8 mode; regenerate sdkconfig from the updated defaults");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -236,7 +236,7 @@ esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
     };
 
     if (ioctl(fd, VIDIOC_S_FMT, &format) != 0) {
-        ESP_LOGE(TAG, "failed to set RAW8 640x400 format");
+        ESP_LOGE(TAG, "failed to set RAW8 1280x720 format");
         goto err;
     }
 
@@ -325,7 +325,7 @@ esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
         goto err;
     }
 
-    ESP_LOGI(TAG, "OV9281 stream requested: 640x400 RAW8; waiting for actual frames");
+    ESP_LOGI(TAG, "OV9281 stream requested: 1280x720 RAW8; waiting for actual frames");
     return ESP_OK;
 
 err:

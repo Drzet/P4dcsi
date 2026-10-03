@@ -1,4 +1,5 @@
 #include "camera_stream.h"
+#include "camera_diag.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -85,7 +86,9 @@ static esp_err_t configure_sensor(int fd)
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "CSI receiver lane rate: %u Mbps", CAMERA_LANE_BIT_RATE_HZ / 1000000);
-    return ESP_OK;
+    /* The mode table ends in 0x0100=1. Stop it before STREAMON configures
+     * the receiver; esp_video starts the sensor after CSI and ISP are ready. */
+    return p4d_camera_sensor_standby(fd);
 }
 
 esp_err_t p4d_camera_init(i2c_master_bus_handle_t i2c_bus)
@@ -174,6 +177,9 @@ static void camera_stream_task(void *arg)
                 if (waits++ % 5U == 0) {
                     ESP_LOGW(TAG, "no completed CSI frame for 2 s (received=%lu, errno=%d); display test pattern is independent",
                              (unsigned long)frames, saved_errno);
+                    if (waits == 1) {
+                        p4d_camera_diagnostics(fd, "first capture timeout");
+                    }
                 }
                 vTaskDelay(1);
                 continue;

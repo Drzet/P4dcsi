@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "display_rpi.c"
         "camera_stream.c"
+        "camera_diag.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_lcd

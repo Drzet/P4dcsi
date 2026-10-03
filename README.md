@@ -47,6 +47,17 @@ sets its lane-rate metadata to 800,000,000, and applies it with
 table, exposure, gain, and lane count are preserved. This is a candidate fix for
 the missing frames; successful compilation does not establish hardware success.
 
+Hardware testing of `db33fb6` confirmed visible colour bars but zero completed
+CSI frames, even with the 800 Mbps receiver setting. The display path is working;
+the cause of the capture failure is still unconfirmed.
+
+The next capture test addresses startup order: the OV9281 mode table ends by
+enabling streaming, before `VIDIOC_STREAMON` creates the receiver. The application
+now puts the sensor into standby through the existing esp_video control interface
+and verifies register `0x0100` before receiver setup. `VIDIOC_STREAMON` subsequently
+starts CSI, ISP, then the sensor. [INFERRED] Starting the sensor early may contribute
+to the missing frames; this change still requires testing on the board.
+
 On boot:
 
 1. The CPU writes colour bars directly to the display framebuffer and holds them
@@ -63,6 +74,10 @@ On boot:
    silently. Repeated waits are logged about every ten seconds. In this pinned
    esp_video version an expired dequeue maps to `EPERM`; the code checks that
    the wait actually elapsed before treating that error as a timeout.
+5. The first timeout also prints a `csi_diag` snapshot: sensor streaming, mode
+   and PLL registers; sampled CSI PHY state; and CSI host, bridge and ISP status.
+   Include that entire snapshot when reporting the result. High-speed clock
+   samples are observations, not a decoded packet or frame count.
 
 | Observation | What it establishes |
 | --- | --- |

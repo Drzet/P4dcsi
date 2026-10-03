@@ -22,4 +22,7 @@ idf_component_register(
 target_link_libraries(${COMPONENT_LIB} INTERFACE "-u ov9281_detect")
 
 # Override only the HD RAW8 ISP creation call; leave managed components intact.
-target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_isp_new_processor")
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=esp_isp_new_processor"
+    "-u __wrap_esp_isp_new_processor"
+)

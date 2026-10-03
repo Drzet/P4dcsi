@@ -14,13 +14,12 @@ static const char *TAG = "P4dcsi";
 #define BOARD_I2C_SDA        7
 #define BOARD_I2C_SCL        8
 
-#define CAM_W                1280
-#define CAM_H                720
+#define CAM_W                640
+#define CAM_H                400
 
-/* 1280x720 -> 800x450 exactly preserves 16:9. */
-#define PREVIEW_W            800
-#define PREVIEW_H            450
-#define PREVIEW_X_OFFSET     0
+#define PREVIEW_W            CAM_W
+#define PREVIEW_H            CAM_H
+#define PREVIEW_X_OFFSET     ((P4D_LCD_H_RES - PREVIEW_W) / 2)
 #define PREVIEW_Y_OFFSET     ((P4D_LCD_V_RES - PREVIEW_H) / 2)
 
 static uint8_t *s_display_fb;
@@ -87,21 +86,18 @@ static void camera_frame(
     }
 
     /*
-     * 1280->800 and 720->450 are both exactly 5/8.
-     * Use nearest-neighbour sampling for the bring-up firmware.
+     * Native-size 640x400 preview centred in the 800x480 framebuffer.
      * There is deliberately no frame limiter: every captured frame updates
      * the framebuffer; the DSI engine displays whichever image is current.
      */
     for (uint32_t y = 0; y < PREVIEW_H; ++y) {
-        const uint32_t src_y = (y * 8U) / 5U;
-        const uint8_t *src = data + (size_t)src_y * CAM_W;
+        const uint8_t *src = data + (size_t)y * CAM_W;
         uint8_t *dst = s_display_fb +
             (((size_t)(y + PREVIEW_Y_OFFSET) * P4D_LCD_H_RES + PREVIEW_X_OFFSET) *
              P4D_LCD_BYTES_PER_PIXEL);
 
         for (uint32_t x = 0; x < PREVIEW_W; ++x) {
-            const uint32_t src_x = (x * 8U) / 5U;
-            const uint8_t gray = src[src_x];
+            const uint8_t gray = src[x];
             dst[0] = gray;
             dst[1] = gray;
             dst[2] = gray;
@@ -118,7 +114,7 @@ static void camera_frame(
     if ((s_display_frames % 50U) == 0) {
         ESP_LOGI(
             TAG,
-            "live: capture=%lu display=%lu, 1280x720 RAW8 -> 800x450 RGB888",
+            "live: capture=%lu display=%lu, 640x400 RAW8 -> centred RGB888",
             (unsigned long)s_capture_frames,
             (unsigned long)s_display_frames);
     }

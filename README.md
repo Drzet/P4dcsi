@@ -55,8 +55,15 @@ The next capture test addresses startup order: the OV9281 mode table ends by
 enabling streaming, before `VIDIOC_STREAMON` creates the receiver. The application
 now puts the sensor into standby through the existing esp_video control interface
 and verifies register `0x0100` before receiver setup. `VIDIOC_STREAMON` subsequently
-starts CSI, ISP, then the sensor. [INFERRED] Starting the sensor early may contribute
-to the missing frames; this change still requires testing on the board.
+starts CSI, ISP, then the sensor.
+
+Hardware testing of `b5bfab3` then confirmed sustained capture: the first buffer
+contained 256,000 bytes and the log reached 2,250 captures with matching framebuffer
+updates. The remaining reported fault was the CPU0 idle-task watchdog while
+`csi_stream` performed the grayscale conversion. The stream loop now blocks for
+one scheduler tick after requeueing a buffer once 100 ms of processing have elapsed,
+allowing lower-priority tasks to run even when dequeue never waits. Watchdog
+checks remain enabled. The scheduling change needs a new hardware run.
 
 On boot:
 

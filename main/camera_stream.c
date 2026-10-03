@@ -135,6 +135,7 @@ static void camera_stream_task(void *arg)
     const int fd = camera->fd;
     uint32_t frames = 0;
     uint32_t waits = 0;
+    int64_t last_idle_break = esp_timer_get_time();
 
     ESP_LOGI(TAG, "waiting for first CSI frame (2 s timeout)");
 
@@ -167,6 +168,13 @@ static void camera_stream_task(void *arg)
             if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
                 ESP_LOGE(TAG, "VIDIOC_QBUF failed: %d", errno);
                 break;
+            }
+            /* A continuously populated capture queue need not block DQBUF.
+             * Let the idle task run periodically, after returning the buffer.
+             * taskYIELD alone would not allow a lower-priority task to run. */
+            if (esp_timer_get_time() - last_idle_break >= 100000) {
+                vTaskDelay(1);
+                last_idle_break = esp_timer_get_time();
             }
         } else {
             const int saved_errno = errno;

@@ -11,19 +11,18 @@ The firmware uses the WT9932P4-TINY shared I2C wiring on GPIO7/8. GPIO0 is drive
 ## Test path
 
 ```
-OV9281 1280x720 RAW8 @ 50 fps
+OV9281 640x400 RAW8 @ 100 fps
         |
         v
 ESP32-P4 MIPI CSI / esp_video
         |
         v
 every captured frame
-nearest-neighbour 1280x720 -> 800x450
 RAW8 -> RGB888 grayscale
         |
         v
 800x480 native DPI framebuffer
-(800x450 image, 15-pixel black bars top/bottom)
+(640x400 image centred, 80 px left/right, 40 px top/bottom)
         |
         v
 ESP32-P4 MIPI DSI

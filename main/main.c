@@ -4,6 +4,8 @@
 #include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "camera_stream.h"
 #include "display_rpi.h"
@@ -26,6 +28,24 @@ static uint8_t *s_display_fb;
 static size_t s_display_fb_size;
 static uint32_t s_capture_frames;
 static uint32_t s_display_frames;
+
+static esp_err_t display_test_pattern(void)
+{
+    static const uint8_t bars[][3] = {
+        {255, 255, 255}, {255, 255, 0}, {0, 255, 255}, {0, 255, 0},
+        {255, 0, 255}, {255, 0, 0}, {0, 0, 255}, {0, 0, 0},
+    };
+    for (size_t y = 0; y < P4D_LCD_V_RES; ++y) {
+        for (size_t x = 0; x < P4D_LCD_H_RES; ++x) {
+            const uint8_t *color = bars[x * 8 / P4D_LCD_H_RES];
+            uint8_t *dst = s_display_fb + (y * P4D_LCD_H_RES + x) * P4D_LCD_BYTES_PER_PIXEL;
+            dst[0] = color[0];
+            dst[1] = color[1];
+            dst[2] = color[2];
+        }
+    }
+    return p4d_display_sync();
+}
 
 static esp_err_t shared_i2c_init(i2c_master_bus_handle_t *ret_bus)
 {
@@ -85,6 +105,19 @@ static void camera_frame(
         return;
     }
 
+    if (s_display_frames == 0) {
+        uint8_t min = 255;
+        uint8_t max = 0;
+        uint32_t sum = 0;
+        for (size_t i = 0; i < (size_t)CAM_W * CAM_H; ++i) {
+            if (data[i] < min) min = data[i];
+            if (data[i] > max) max = data[i];
+            sum += data[i];
+        }
+        ESP_LOGI(TAG, "first image: min=%u max=%u mean=%lu", min, max,
+                 (unsigned long)(sum / (CAM_W * CAM_H)));
+    }
+
     /*
      * Native-size 640x400 preview centred in the 800x480 framebuffer.
      * There is deliberately no frame limiter: every captured frame updates
@@ -140,6 +173,14 @@ void app_main(void)
 
     ESP_LOGI(TAG, "display framebuffer size=%u", (unsigned)s_display_fb_size);
 
+    err = display_test_pattern();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "display test pattern failed: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "DISPLAY TEST: colour bars for 3 s before camera initialization; bars remain until frames arrive");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
     err = p4d_camera_init(i2c_bus);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "camera init failed: %s", esp_err_to_name(err));
@@ -155,5 +196,5 @@ void app_main(void)
         return;
     }
 
-    ESP_LOGI(TAG, "end-to-end test running");
+    ESP_LOGI(TAG, "initialization complete; first CSI frame/live logs confirm data flow");
 }

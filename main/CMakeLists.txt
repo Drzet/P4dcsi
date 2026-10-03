@@ -7,6 +7,7 @@ idf_component_register(
     REQUIRES
         esp_lcd
         esp_mm
+        esp_timer
         esp_hw_support
         esp_driver_i2c
         esp_hal_lcd

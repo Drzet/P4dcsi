@@ -23,8 +23,8 @@ static const char *TAG = "p4d_camera";
 #define CAMERA_TASK_PRIORITY   8
 #define CAMERA_TASK_CORE       0
 
-#define CAMERA_WIDTH           1280
-#define CAMERA_HEIGHT          720
+#define CAMERA_WIDTH           640
+#define CAMERA_HEIGHT          400
 
 typedef struct {
     uint8_t *ptr;
@@ -110,7 +110,7 @@ static esp_err_t camera_open_and_map(void)
     };
 
     if (ioctl(s_fd, VIDIOC_S_FMT, &fmt) != 0) {
-        ESP_LOGE(TAG, "VIDIOC_S_FMT RAW8 1280x720 failed");
+        ESP_LOGE(TAG, "VIDIOC_S_FMT RAW8 640x400 failed");
         return ESP_FAIL;
     }
 

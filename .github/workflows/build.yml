@@ -1,0 +1,17 @@
+name: ESP-IDF build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set target
+        run: idf.py set-target esp32p4
+      - name: Build
+        run: idf.py build
